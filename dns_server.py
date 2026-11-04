@@ -5,6 +5,16 @@ import threading
 ROOT = ['198.41.0.4']
 
 
+def recvall(sock, n):
+    data = b''
+    while len(data) < n:
+        packet = sock.recv(n - len(data))
+        if not packet:
+            return None
+        data += packet
+    return data
+
+
 def encode_domain(name):
     parts = name.encode().split(b'.')
     result = b''
@@ -32,6 +42,10 @@ def decode_domain(data, offset):
 
 
 def parse_response(resp):
+    if len(resp) < 12:
+        return b'', 0, [], {}, 2
+    flags = struct.unpack('!H', resp[2:4])[0]
+    rcode = flags & 0x000F
     _, _, qd, an, ns, ar = struct.unpack('!HHHHHH', resp[:12])
     offset = 12
     for _ in range(qd):
@@ -62,54 +76,71 @@ def parse_response(resp):
             glue[name.lower()] = socket.inet_ntoa(resp[offset: offset + 4])
         offset += rdlen
 
-    return resp[ans_start:ans_end], an, ns_recs, glue
+    return resp[ans_start:ans_end], an, ns_recs, glue, rcode
 
 
 def resolve(query):
+    qname, offset = decode_domain(query, 12)
+    qtype, qclass = struct.unpack('!HH', query[offset: offset + 4])
+
     servers = ROOT
     for _ in range(5):
         next_s = []
         for ip in servers:
             try:
-                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                packet = struct.pack('!HHHHHH', 0x1234, 0x0000, 1, 0, 0, 0) + encode_domain(qname) + struct.pack('!HH',
+                                                                                                                 qtype,
+                                                                                                                 qclass)
+                with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
                     s.settimeout(2)
-                    s.connect((ip, 53))
-                    s.sendall(struct.pack('!H', len(query)) + query)
-                    resp = s.recv(struct.unpack('!H', s.recv(2))[0])
-                ans, an_count, ns_recs, glue = parse_response(resp)
-                if an_count > 0:
-                    return ans, an_count
+                    s.sendto(packet, (ip, 53))
+                    resp, _ = s.recvfrom(512)
+                ans, an_count, ns_recs, glue, rcode = parse_response(resp)
+                if an_count > 0 or rcode != 0:
+                    return ans, an_count, rcode
                 next_s.extend(glue[n.lower()] for n in ns_recs if n.lower() in glue)
             except:
                 continue
         if not next_s:
             break
         servers = next_s
-    return None, 0
+    return None, 0, 2
 
 
 def process_query(data):
     tx_id = struct.unpack('!H', data[:2])[0]
     qname, offset = decode_domain(data, 12)
-    ans, an_count = resolve(data)
+    ans, an_count, rcode = resolve(data)
 
     if an_count == 0:
-        # Статус NXDOMAIN (ошибка: домен не найден)
-        return struct.pack('!HHHHHH', tx_id, 0x8183, 1, 0, 0, 0) + data[12: offset + 4]
+        flags = 0x8100 | (rcode & 0x000F)
+        return struct.pack('!HHHHHH', tx_id, flags, 1, 0, 0, 0) + data[12: offset + 4]
 
-    return struct.pack('!HHHHHH', tx_id, 0x8180, 1, an_count, 0, 0) + data[12: offset + 4] + ans
+    flags = 0x8180 | (rcode & 0x000F)
+    return struct.pack('!HHHHHH', tx_id, flags, 1, an_count, 0, 0) + data[12: offset + 4] + ans
 
 
 def handle_tcp(conn):
     try:
-        if length := conn.recv(2):
-            data = conn.recv(struct.unpack('!H', length)[0])
-            resp = process_query(data)
-            conn.sendall(struct.pack('!H', len(resp)) + resp)
+        length_bytes = recvall(conn, 2)
+        if length_bytes:
+            length = struct.unpack('!H', length_bytes)[0]
+            data = recvall(conn, length)
+            if data:
+                resp = process_query(data)
+                conn.sendall(struct.pack('!H', len(resp)) + resp)
     except:
         pass
     finally:
         conn.close()
+
+
+def handle_udp(udp, data, addr):
+    try:
+        response = process_query(data)
+        udp.sendto(response, addr)
+    except:
+        pass
 
 
 def run_udp():
@@ -117,8 +148,7 @@ def run_udp():
     udp.bind(('127.0.0.1', 5353))
     while True:
         data, addr = udp.recvfrom(512)
-        response = process_query(data)
-        udp.sendto(response, addr)
+        threading.Thread(target=handle_udp, args=(udp, data, addr), daemon=True).start()
 
 
 def run_tcp():
