@@ -109,16 +109,16 @@ def resolve(query):
 
 def process_query(data):
     tx_id = struct.unpack('!H', data[:2])[0]
+
+    request_flags = struct.unpack('!H', data[2:4])[0]
+
     qname, offset = decode_domain(data, 12)
     ans, an_count, rcode = resolve(data)
-
+    flags = (request_flags & 0x7FF0) | 0x8000 | rcode
+    
     if an_count == 0:
-        flags = 0x8100 | (rcode & 0x000F)
-        return struct.pack('!HHHHHH', tx_id, flags, 1, 0, 0, 0) + data[12: offset + 4]
-
-    flags = 0x8180 | (rcode & 0x000F)
-    return struct.pack('!HHHHHH', tx_id, flags, 1, an_count, 0, 0) + data[12: offset + 4] + ans
-
+        return struct.pack('!HHHHHH', tx_id, flags, 1, 0, 0, 0) + data[12:offset + 4]
+    return struct.pack('!HHHHHH', tx_id, flags, 1, an_count, 0, 0) + data[12:offset + 4] + ans
 
 def handle_tcp(conn):
     try:
